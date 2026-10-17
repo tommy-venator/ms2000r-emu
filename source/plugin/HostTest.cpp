@@ -80,7 +80,7 @@ void play(juce::AudioPluginInstance& inst, juce::AudioBuffer<float>& out, int fr
         const double t0 = juce::Time::getMillisecondCounterHiRes();
         inst.processBlock(buf, midi);
         g_blockMs.push_back(juce::Time::getMillisecondCounterHiRes() - t0);
-        if (g_pump && ((pos / block) % 8) == 0) juce::MessageManager::getInstance()->runDispatchLoopUntil(1);
+        if (g_pump && ((pos / block) % 8) == 0) juce::MessageManager::getInstance()->runDispatchLoopUntil(5);
         for (const auto m : midi) { (void)m; ++midiOut; }
         if (g_echo) g_echoBuf = midi;
         for (int ch = 0; ch < 2; ++ch) out.copyFrom(ch, pos, buf, ch, 0, n);
@@ -132,6 +132,27 @@ bool sameEdit(const juce::ValueTree& a, const juce::ValueTree& b)
     const auto* y = b.getProperty("editBuffer").getBinaryData();
     return x && y && *x == *y && int(a.getProperty("program", -1)) == int(b.getProperty("program", -1));
 }
+juce::String lcdOf(const juce::ValueTree& t)
+{
+    const auto* mb = t.getProperty("lcd").getBinaryData();
+    if (!mb || mb->getSize() != 34) return "-";
+    const auto* p = static_cast<const uint8_t*>(mb->getData());
+    juce::String s;
+    for (int i = 0; i < 32; ++i) {
+        if (i == 16) s << "|";
+        s << juce::String::toHexString(int(p[i])).paddedLeft('0', 2);
+    }
+    s << "/" << int(p[32]) << "," << int(p[33]);
+    return s;
+}
+bool sameScreen(const juce::ValueTree& a, const juce::ValueTree& b)
+{
+    const auto* x = a.getProperty("screenKeys").getBinaryData();
+    const auto* y = b.getProperty("screenKeys").getBinaryData();
+    const auto* lx = a.getProperty("lcd").getBinaryData();
+    const auto* ly = b.getProperty("lcd").getBinaryData();
+    return x && y && *x == *y && lx && ly && *lx == *ly;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -159,10 +180,17 @@ int main(int argc, char** argv)
         g_smf.emplace_back(int(3 * rate), juce::MidiMessage::programChange(1, 8));
         play(*inst, tmp, 0, int(4 * rate), block, -1, -1, mo);
         g_smf.clear();
+        auto seed = stateOf(*inst);
+        const uint8_t editKeys[] = { 3, 7, 4, 2 };
+        seed.setProperty("screenKeys", juce::MemoryBlock(editKeys, sizeof editKeys), nullptr);
+        setState(*inst, seed);
+        g_pump = true;
+        play(*inst, tmp, int(4 * rate), int(8 * rate), block, -1, -1, mo);
+        g_pump = false;
         auto a = stateOf(*inst);
         a.setProperty("knobs", "100,200,300,400,500,600,700,800,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,1000", nullptr);
         a.setProperty("mic2", true, nullptr); a.setProperty("editorW", 1234, nullptr);
-        std::cout << "A: " << flashOf(a) << ", edit " << editName(a) << "\n";
+        std::cout << "A: " << flashOf(a) << ", edit " << editName(a) << ", lcd " << lcdOf(a) << "\n";
         inst->releaseResources(); inst.reset();
         inst = load(fmt, *descs[0], rate, block);
         if (!inst) return 3;
@@ -173,9 +201,10 @@ int main(int argc, char** argv)
         play(*inst, tmp, 0, int(7 * rate), block, -1, -1, mo);
         g_pump = false;
         const auto b = stateOf(*inst);
-        std::cout << "B: " << flashOf(b) << ", edit " << editName(b) << "\n";
+        std::cout << "B: " << flashOf(b) << ", edit " << editName(b) << ", lcd " << lcdOf(b) << "\n";
         const bool same = flashOf(a) == flashOf(b) && a.getProperty("knobs") == b.getProperty("knobs")
-                       && bool(b.getProperty("mic2")) && int(b.getProperty("editorW")) == 1234 && sameEdit(a, b);
+                       && bool(b.getProperty("mic2")) && int(b.getProperty("editorW")) == 1234 && sameEdit(a, b)
+                       && sameScreen(a, b);
         std::cout << "state round trip: " << (same ? "SAME" : "DIFFERENT") << "\n";
         if (!same) rc = 5;
 

@@ -33,6 +33,14 @@ constexpr uint32_t kEditBufferAddr = 0x402E0Eu;
 constexpr uint32_t kProgramBankOffset = 0xA0400u;
 constexpr size_t kProgramBytes = 254;
 
+bool isSafeScreenKey(unsigned col, unsigned row)
+{
+    const bool root = col == 3 && (row == 6 || row == 7);
+    const bool lcdNavigation = col == 4 && (row == 0 || row == 2 || row == 3 || row == 6 || row == 7);
+    const bool selection = (col == 0 && row == 3) || (col == 1 && row == 2);
+    return root || lcdNavigation || selection;
+}
+
 bool validEditBuffer(const std::vector<uint8_t>& p)
 {
     if (p.size() != kProgramBytes) return false;
@@ -142,6 +150,7 @@ void Ms2kProcessor::timerCallback()
     m_syx.poll();
     powerSwitchPoll();
     restoreProjectEditBuffer();
+    restoreProjectScreen();
     // HOSTDIAG-1 (R2, default off): MS2K_HOSTDIAG=1 -> once a second to the debugger output (DebugView): is the
     // host still calling processBlock, does the machine advance, and does render() hand out silence. For the
     // VSTHost-only freeze after Demo -> EXIT (2026-10-08): all threads idle-wait in the dump, no spinner.
@@ -325,8 +334,29 @@ void Ms2kProcessor::userKnob(unsigned mux, unsigned x, uint16_t v)
 
 void Ms2kProcessor::userKey(unsigned col, unsigned row, bool down)
 {
+    if (down) rememberScreenKey(col, row);
     setSwitch(col, row, down);
     if (col < 8 && row < 8) userParam(m_keyParam[col][row], down ? 1.0f : 0.0f);
+}
+
+void Ms2kProcessor::rememberScreenKey(unsigned col, unsigned row)
+{
+    std::lock_guard<std::mutex> l(m_screenMx);
+    if (m_restoreScreenDown && m_runner && m_restoreScreenIndex + 1 < m_screenKeys.size())
+        m_runner->getEmulator().setPanelSwitch(m_screenKeys[m_restoreScreenIndex], m_screenKeys[m_restoreScreenIndex + 1], false);
+    m_restoreScreenPending = false;
+    m_restoreScreenDown = false;
+    if ((col == 5 || col == 6) && row < 8) {
+        m_screenKeys.clear();
+        return;
+    }
+
+    const bool root = (col == 3 && (row == 6 || row == 7));
+    if (!isSafeScreenKey(col, row)) return;
+    if (root) m_screenKeys.clear();
+    if (m_screenKeys.size() >= 128) return;
+    m_screenKeys.push_back(uint8_t(col));
+    m_screenKeys.push_back(uint8_t(row));
 }
 
 void Ms2kProcessor::userVolume()
@@ -466,6 +496,13 @@ bool Ms2kProcessor::startMachine()
         std::lock_guard<std::mutex> l(m_editBufferMx);
         if (validEditBuffer(m_projectEditBuffer)) m_restoreEditPending = true;
     }
+    {
+        std::lock_guard<std::mutex> l(m_screenMx);
+        m_restoreScreenIndex = 0;
+        m_restoreScreenDown = false;
+        m_restoreScreenDelay = 2;
+        m_restoreScreenPending = !m_screenKeys.empty();
+    }
     const uint32_t fm = m_runner->getEmulator().getFlashROM().stateMask();
     setStatus("running - " + m_home.getFullPathName() + (m_haveProjectFlash ? "  (flash from the project" : "  (flash from the folder")
               + (fm ? ", sectors " + juce::String::toHexString(int(fm)).toUpperCase() + ")" : ", factory)"));
@@ -503,6 +540,37 @@ void Ms2kProcessor::restoreProjectEditBuffer()
         std::lock_guard<std::mutex> l(m_editBufferMx);
         m_restoreEditActive = true;
     }
+}
+
+void Ms2kProcessor::restoreProjectScreen()
+{
+    std::lock_guard<std::mutex> l(m_screenMx);
+    if (!m_restoreScreenPending || !m_runner) return;
+    {
+        std::lock_guard<std::mutex> e(m_editBufferMx);
+        if (m_restoreEditPending || m_restoreEditActive) return;
+    }
+    if (m_syx.busy()) return;
+    if (m_restoreScreenDelay > 0) {
+        --m_restoreScreenDelay;
+        return;
+    }
+    if (m_restoreScreenIndex + 1 >= m_screenKeys.size()) {
+        m_restoreScreenPending = false;
+        m_restoreScreenDown = false;
+        return;
+    }
+
+    const unsigned col = m_screenKeys[m_restoreScreenIndex];
+    const unsigned row = m_screenKeys[m_restoreScreenIndex + 1];
+    m_runner->getEmulator().setPanelSwitch(col, row, !m_restoreScreenDown);
+    if (m_restoreScreenDown) {
+        m_restoreScreenDown = false;
+        m_restoreScreenIndex += 2;
+    } else {
+        m_restoreScreenDown = true;
+    }
+    m_restoreScreenDelay = 1;
 }
 
 void Ms2kProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
@@ -908,13 +976,14 @@ void Ms2kProcessor::saveGlobalSettings() const
 }
 
 // ---- plugin state (VST3-2) ----
-// A ValueTree "MS2000R": v=2, knobs = 32 positions "a,b,..", in1/in2/volume, mic2/dac20, editorW/editorTab,
+// A ValueTree "MS2000R": v=3, knobs = 32 positions "a,b,..", in1/in2/volume, mic2/dac20, editorW/editorTab,
 // flashMask (sectors SA0..SA18 not factory any more) and flash = those sectors' bytes in SA order, gzipped.
 // The complete live edit buffer and its program slot are saved too, so the project recalls the audible program.
+// screenKeys holds safe front-panel navigation presses, replayed after the program so the firmware restores its LCD page.
 void Ms2kProcessor::getStateInformation(juce::MemoryBlock& dest)
 {
     juce::ValueTree t("MS2000R");
-    t.setProperty("v", 2, nullptr);
+    t.setProperty("v", 3, nullptr);
     juce::String k;
     for (int i = 0; i < 32; ++i) k << (i ? "," : "") << int(knobs[i / 8][i % 8]);
     t.setProperty("knobs", k, nullptr);
@@ -952,6 +1021,22 @@ void Ms2kProcessor::getStateInformation(juce::MemoryBlock& dest)
         std::lock_guard<std::mutex> l(m_editBufferMx);
         m_projectEditBuffer = edit;
         m_projectProgram = program;
+    }
+    {
+        std::lock_guard<std::mutex> l(m_screenMx);
+        if (!m_screenKeys.empty()) {
+            juce::MemoryBlock mb(m_screenKeys.data(), m_screenKeys.size());
+            t.setProperty("screenKeys", mb, nullptr);
+        }
+    }
+    if (m_runner) {
+        const auto lcd = m_runner->getLcdGuiSnapshot();
+        uint8_t raw[34]{};
+        std::copy(lcd.line0, lcd.line0 + 16, raw);
+        std::copy(lcd.line1, lcd.line1 + 16, raw + 16);
+        raw[32] = uint8_t(lcd.curLine);
+        raw[33] = uint8_t(lcd.curCol);
+        t.setProperty("lcd", juce::MemoryBlock(raw, sizeof raw), nullptr);
     }
     uint32_t mask = 0; const uint8_t* img = nullptr;
     if (m_runner) { auto& f = m_runner->getEmulator().getFlashROM(); mask = f.stateMask(); img = f.data(); }
@@ -999,6 +1084,23 @@ void Ms2kProcessor::setStateInformation(const void* data, int size)
         m_projectProgram = juce::jlimit(-1, 127, int(t.getProperty("program", -1)));
         m_restoreEditPending = !m_projectEditBuffer.empty();
         m_restoreEditActive = false;
+    }
+    {
+        std::lock_guard<std::mutex> l(m_screenMx);
+        if (m_restoreScreenDown && m_runner && m_restoreScreenIndex + 1 < m_screenKeys.size())
+            m_runner->getEmulator().setPanelSwitch(m_screenKeys[m_restoreScreenIndex], m_screenKeys[m_restoreScreenIndex + 1], false);
+        m_screenKeys.clear();
+        if (const auto* mb = t.getProperty("screenKeys").getBinaryData(); mb && mb->getSize() <= 128 && (mb->getSize() & 1u) == 0) {
+            const auto* p = static_cast<const uint8_t*>(mb->getData());
+            bool valid = true;
+            for (size_t i = 0; i < mb->getSize(); i += 2)
+                valid = valid && isSafeScreenKey(p[i], p[i + 1]);
+            if (valid) m_screenKeys.assign(p, p + mb->getSize());
+        }
+        m_restoreScreenIndex = 0;
+        m_restoreScreenDown = false;
+        m_restoreScreenDelay = 2;
+        m_restoreScreenPending = !m_screenKeys.empty();
     }
     syncParams();                                        // AUTOMATION-1: the parameters show this project's panel
 
