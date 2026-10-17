@@ -29,6 +29,38 @@ namespace {
 std::atomic<bool> g_machineTaken{ false };
 std::atomic<int> g_liveProcessors{ 0 };   // MULTI-1: read by the loader module (ms2k_liveProcessors)
 std::atomic<int> g_createdProcessors{ 0 };   // MAC-4: ever constructed here - the AU loader's "handed out and opened"
+constexpr uint32_t kEditBufferAddr = 0x402E0Eu;
+constexpr uint32_t kProgramBankOffset = 0xA0400u;
+constexpr size_t kProgramBytes = 254;
+
+bool validEditBuffer(const std::vector<uint8_t>& p)
+{
+    if (p.size() != kProgramBytes) return false;
+    bool hasName = false;
+    for (size_t i = 0; i < 12; ++i) {
+        if (p[i] < 0x20 || p[i] >= 0x7F) return false;
+        hasName = hasName || p[i] != 0x20;
+    }
+    return hasName;
+}
+
+int findProgram(const std::vector<uint8_t>& p, const uint8_t* flash)
+{
+    if (!validEditBuffer(p) || flash == nullptr) return -1;
+    for (int i = 0; i < 128; ++i) {
+        const auto* q = flash + kProgramBankOffset + size_t(i) * kProgramBytes;
+        if (std::equal(p.begin(), p.end(), q)) return i;
+    }
+    int found = -1;
+    for (int i = 0; i < 128; ++i) {
+        const auto* q = flash + kProgramBankOffset + size_t(i) * kProgramBytes;
+        if (std::equal(p.begin(), p.begin() + 12, q)) {
+            if (found >= 0) return -1;
+            found = i;
+        }
+    }
+    return found;
+}
 
 bool validHome(const juce::File& d)
 {
@@ -109,6 +141,7 @@ void Ms2kProcessor::timerCallback()
 {
     m_syx.poll();
     powerSwitchPoll();
+    restoreProjectEditBuffer();
     // HOSTDIAG-1 (R2, default off): MS2K_HOSTDIAG=1 -> once a second to the debugger output (DebugView): is the
     // host still calling processBlock, does the machine advance, and does render() hand out silence. For the
     // VSTHost-only freeze after Demo -> EXIT (2026-10-08): all threads idle-wait in the dump, no spinner.
@@ -335,6 +368,14 @@ void Ms2kProcessor::powerSwitchPoll()
         m_projectMask = f.stateMask();
         m_projectImage.assign(f.data(), f.data() + f.size());
         m_haveProjectFlash = true;
+        std::vector<uint8_t> edit(kProgramBytes);
+        for (size_t i = 0; i < edit.size(); ++i)
+            edit[i] = m_runner->getEmulator().peekExternal(kEditBufferAddr + uint32_t(i));
+        if (validEditBuffer(edit)) {
+            std::lock_guard<std::mutex> e(m_editBufferMx);
+            m_projectProgram = findProgram(edit, f.data());
+            m_projectEditBuffer = std::move(edit);
+        }
         stopMachine();
         clearStreams();
         m_poweredOff = true;
@@ -391,7 +432,7 @@ bool Ms2kProcessor::chooseHome(const juce::File& d)
 
 bool Ms2kProcessor::startMachine()
 {
-
+    m_machineStartFrame.store(m_frames.load(std::memory_order_relaxed), std::memory_order_relaxed);
     MS2000::Ms2kConfig cfg;
     cfg.romPath = "flash.bin";
     cfg.cpuCyclesPerTick = 20000;
@@ -421,10 +462,47 @@ bool Ms2kProcessor::startMachine()
         m_syx.feed(b);
     });
     applyPanel();
+    {
+        std::lock_guard<std::mutex> l(m_editBufferMx);
+        if (validEditBuffer(m_projectEditBuffer)) m_restoreEditPending = true;
+    }
     const uint32_t fm = m_runner->getEmulator().getFlashROM().stateMask();
     setStatus("running - " + m_home.getFullPathName() + (m_haveProjectFlash ? "  (flash from the project" : "  (flash from the folder")
               + (fm ? ", sectors " + juce::String::toHexString(int(fm)).toUpperCase() + ")" : ", factory)"));
     return true;
+}
+
+void Ms2kProcessor::restoreProjectEditBuffer()
+{
+    std::vector<uint8_t> edit;
+    int program = -1;
+    {
+        std::lock_guard<std::mutex> l(m_editBufferMx);
+        if (m_restoreEditActive && !m_syx.busy()) {
+            m_restoreEditActive = false;
+            m_restoreEditPending = false;
+        }
+        if (!m_restoreEditPending || m_restoreEditActive || m_syx.busy()) return;
+        edit = m_projectEditBuffer;
+        program = m_projectProgram;
+    }
+    if (!m_runner || !validEditBuffer(edit)) return;
+    const auto now = m_frames.load(std::memory_order_relaxed);
+    const auto started = m_machineStartFrame.load(std::memory_order_relaxed);
+    if (now < started || double(now - started) < 3.0 * m_hostRate) return;
+
+    std::vector<uint8_t> live(kProgramBytes);
+    for (size_t i = 0; i < live.size(); ++i)
+        live[i] = m_runner->getEmulator().peekExternal(kEditBufferAddr + uint32_t(i));
+    if (!validEditBuffer(live)) return;
+
+    std::string name;
+    for (size_t i = 0; i < 12 && edit[i] != 0; ++i) name.push_back(char(edit[i]));
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    if (m_syx.startProgram(edit, "project program " + name, program)) {
+        std::lock_guard<std::mutex> l(m_editBufferMx);
+        m_restoreEditActive = true;
+    }
 }
 
 void Ms2kProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
@@ -830,12 +908,13 @@ void Ms2kProcessor::saveGlobalSettings() const
 }
 
 // ---- plugin state (VST3-2) ----
-// A ValueTree "MS2000R": v=1, knobs = 32 positions "a,b,..", in1/in2/volume, mic2/dac20, editorW/editorTab,
+// A ValueTree "MS2000R": v=2, knobs = 32 positions "a,b,..", in1/in2/volume, mic2/dac20, editorW/editorTab,
 // flashMask (sectors SA0..SA18 not factory any more) and flash = those sectors' bytes in SA order, gzipped.
+// The complete live edit buffer and its program slot are saved too, so the project recalls the audible program.
 void Ms2kProcessor::getStateInformation(juce::MemoryBlock& dest)
 {
     juce::ValueTree t("MS2000R");
-    t.setProperty("v", 1, nullptr);
+    t.setProperty("v", 2, nullptr);
     juce::String k;
     for (int i = 0; i < 32; ++i) k << (i ? "," : "") << int(knobs[i / 8][i % 8]);
     t.setProperty("knobs", k, nullptr);
@@ -850,6 +929,30 @@ void Ms2kProcessor::getStateInformation(juce::MemoryBlock& dest)
     t.setProperty("powerSwitch", powerSwitch.load(), nullptr);
     t.setProperty("boostDb", boostDb.load(), nullptr);
     t.setProperty("libraryPath", libraryPath, nullptr);
+    std::vector<uint8_t> edit;
+    int program = -1;
+    {
+        std::lock_guard<std::mutex> l(m_editBufferMx);
+        if (m_restoreEditPending || m_restoreEditActive) {
+            edit = m_projectEditBuffer;
+            program = m_projectProgram;
+        }
+    }
+    if (edit.empty() && m_runner) {
+        edit.resize(kProgramBytes);
+        for (size_t i = 0; i < edit.size(); ++i)
+            edit[i] = m_runner->getEmulator().peekExternal(kEditBufferAddr + uint32_t(i));
+        if (!validEditBuffer(edit)) edit.clear();
+        else program = findProgram(edit, m_runner->getEmulator().getFlashROM().data());
+    }
+    if (validEditBuffer(edit)) {
+        juce::MemoryBlock mb(edit.data(), edit.size());
+        t.setProperty("editBuffer", mb, nullptr);
+        if (program >= 0) t.setProperty("program", program, nullptr);
+        std::lock_guard<std::mutex> l(m_editBufferMx);
+        m_projectEditBuffer = edit;
+        m_projectProgram = program;
+    }
     uint32_t mask = 0; const uint8_t* img = nullptr;
     if (m_runner) { auto& f = m_runner->getEmulator().getFlashROM(); mask = f.stateMask(); img = f.data(); }
     else if (m_haveProjectFlash && m_projectMask) { mask = m_projectMask; img = m_projectImage.data(); }
@@ -887,6 +990,16 @@ void Ms2kProcessor::setStateInformation(const void* data, int size)
     powerSwitch = bool(t.getProperty("powerSwitch", powerSwitch.load()));
     boostDb = juce::jlimit(0, 12, int(t.getProperty("boostDb", boostDb.load())));
     libraryPath = t.getProperty("libraryPath", "").toString();
+    {
+        std::lock_guard<std::mutex> l(m_editBufferMx);
+        m_projectEditBuffer.clear();
+        if (const auto* mb = t.getProperty("editBuffer").getBinaryData(); mb && mb->getSize() == kProgramBytes)
+            m_projectEditBuffer.assign(static_cast<const uint8_t*>(mb->getData()), static_cast<const uint8_t*>(mb->getData()) + mb->getSize());
+        if (!validEditBuffer(m_projectEditBuffer)) m_projectEditBuffer.clear();
+        m_projectProgram = juce::jlimit(-1, 127, int(t.getProperty("program", -1)));
+        m_restoreEditPending = !m_projectEditBuffer.empty();
+        m_restoreEditActive = false;
+    }
     syncParams();                                        // AUTOMATION-1: the parameters show this project's panel
 
     // the flash this project's machine had

@@ -117,6 +117,21 @@ juce::String flashOf(const juce::ValueTree& t)
     return "mask " + juce::String::toHexString(int(t.getProperty("flashMask", 0))).toUpperCase() + ", "
          + juce::String(mb ? int(mb->getSize()) : 0) + " bytes gz, fnv " + (mb ? juce::String::toHexString((juce::int64)fnv(*mb)) : juce::String("-"));
 }
+juce::String editName(const juce::ValueTree& t)
+{
+    const auto* mb = t.getProperty("editBuffer").getBinaryData();
+    if (!mb || mb->getSize() != 254) return "-";
+    const auto* p = static_cast<const uint8_t*>(mb->getData());
+    juce::String s;
+    for (int i = 0; i < 12; ++i) s << juce::juce_wchar(p[i]);
+    return s.trimEnd() + " (program " + juce::String(int(t.getProperty("program", -1))) + ")";
+}
+bool sameEdit(const juce::ValueTree& a, const juce::ValueTree& b)
+{
+    const auto* x = a.getProperty("editBuffer").getBinaryData();
+    const auto* y = b.getProperty("editBuffer").getBinaryData();
+    return x && y && *x == *y && int(a.getProperty("program", -1)) == int(b.getProperty("program", -1));
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -139,24 +154,59 @@ int main(int argc, char** argv)
     int rc = 0;
     if (mode == "state") {
         inst->prepareToPlay(rate, block);
-        juce::AudioBuffer<float> tmp(2, int(3 * rate)); int mo = 0;
-        play(*inst, tmp, 0, int(3 * rate), block, -1, -1, mo);
+        juce::AudioBuffer<float> tmp(2, int(15 * rate)); int mo = 0;
+        tmp.clear();
+        g_smf.emplace_back(int(3 * rate), juce::MidiMessage::programChange(1, 8));
+        play(*inst, tmp, 0, int(4 * rate), block, -1, -1, mo);
+        g_smf.clear();
         auto a = stateOf(*inst);
         a.setProperty("knobs", "100,200,300,400,500,600,700,800,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,1000", nullptr);
         a.setProperty("mic2", true, nullptr); a.setProperty("editorW", 1234, nullptr);
-        std::cout << "A: " << flashOf(a) << "\n";
+        std::cout << "A: " << flashOf(a) << ", edit " << editName(a) << "\n";
         inst->releaseResources(); inst.reset();
         inst = load(fmt, *descs[0], rate, block);
         if (!inst) return 3;
         setState(*inst, a);                         // before prepareToPlay: a project being opened
         inst->prepareToPlay(rate, block);
-        play(*inst, tmp, 0, int(3 * rate), block, -1, -1, mo);
+        tmp.clear();
+        g_pump = true;
+        play(*inst, tmp, 0, int(7 * rate), block, -1, -1, mo);
+        g_pump = false;
         const auto b = stateOf(*inst);
-        std::cout << "B: " << flashOf(b) << "\n";
+        std::cout << "B: " << flashOf(b) << ", edit " << editName(b) << "\n";
         const bool same = flashOf(a) == flashOf(b) && a.getProperty("knobs") == b.getProperty("knobs")
-                       && bool(b.getProperty("mic2")) && int(b.getProperty("editorW")) == 1234;
+                       && bool(b.getProperty("mic2")) && int(b.getProperty("editorW")) == 1234 && sameEdit(a, b);
         std::cout << "state round trip: " << (same ? "SAME" : "DIFFERENT") << "\n";
         if (!same) rc = 5;
+
+        const double beatsPerSecond = 132.0 / 60.0;
+        const int base = int(7 * rate);
+        const int firstOff = base + int((3.8316849816849818 / beatsPerSecond) * rate);
+        const int second = base + int(((8.0 - 1.0479530885780886) / beatsPerSecond) * rate);
+        const int secondOff = second + int((5.4169684482184479 / beatsPerSecond) * rate);
+        g_smf.emplace_back(base, juce::MidiMessage::noteOn(1, 74, (juce::uint8)36));
+        g_smf.emplace_back(firstOff, juce::MidiMessage::noteOff(1, 74));
+        g_smf.emplace_back(second, juce::MidiMessage::noteOn(1, 57, (juce::uint8)50));
+        g_smf.emplace_back(secondOff, juce::MidiMessage::noteOff(1, 57));
+        play(*inst, tmp, base, int(14 * rate), block, -1, -1, mo);
+        g_smf.clear();
+        float maxStep = 0.0f; int sharpSteps = 0, unexpectedSharpSteps = 0;
+        for (int ch = 0; ch < 2; ++ch) {
+            const auto* p = tmp.getReadPointer(ch);
+            for (int i = base + 1; i < int(14 * rate); ++i) {
+                const float d = std::abs(p[i] - p[i - 1]);
+                maxStep = juce::jmax(maxStep, d);
+                if (d > 0.25f) {
+                    ++sharpSteps;
+                    const bool nearMidi = std::abs(i - base) <= 2 * block || std::abs(i - firstOff) <= 2 * block
+                                       || std::abs(i - second) <= 2 * block || std::abs(i - secondOff) <= 2 * block;
+                    if (!nearMidi) ++unexpectedSharpSteps;
+                }
+            }
+        }
+        std::cout << "recalled A09 notes: max sample step " << maxStep << ", sharp steps " << sharpSteps
+                  << ", unexpected away from MIDI " << unexpectedSharpSteps << "\n";
+        if (unexpectedSharpSteps != 0) rc = 6;
         secs = 0;
     }
 
