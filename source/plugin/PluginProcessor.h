@@ -114,6 +114,7 @@ private:
     void applyPanel();                       // knobs + input stage + DAC into a running machine
     void clearStreams();                     // the audio/MIDI queues of a stopped machine
     void restoreProjectEditBuffer();         // message thread: load the saved live program after firmware boot
+    void restoreProjectAudioInThru();        // message thread: restore the power-on-only AudioInThru option
     void restoreProjectScreen();             // message thread: replay saved safe LCD navigation keys
     void rememberScreenKey(unsigned col, unsigned row);
     // PWR-SW-1: the Master VR at its minimum switches the machine off (flash kept, as on the unit), turning it up
@@ -150,6 +151,13 @@ private:
     int m_projectProgram = -1;
     bool m_restoreEditPending = false;
     bool m_restoreEditActive = false;
+    std::mutex m_globalDataMx;
+    std::vector<uint8_t> m_projectGlobalData;
+    bool m_projectAudioInThru = false;
+    size_t m_restoreAudioInThruIndex = 0;
+    bool m_restoreAudioInThruPending = false;
+    bool m_restoreAudioInThruDown = false;
+    int m_restoreAudioInThruDelay = 0;
     std::mutex m_screenMx;
     std::vector<uint8_t> m_screenKeys;        // column,row pairs from the current program's main screen
     size_t m_restoreScreenIndex = 0;

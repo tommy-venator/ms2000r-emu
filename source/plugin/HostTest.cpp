@@ -80,7 +80,7 @@ void play(juce::AudioPluginInstance& inst, juce::AudioBuffer<float>& out, int fr
         const double t0 = juce::Time::getMillisecondCounterHiRes();
         inst.processBlock(buf, midi);
         g_blockMs.push_back(juce::Time::getMillisecondCounterHiRes() - t0);
-        if (g_pump && ((pos / block) % 8) == 0) juce::MessageManager::getInstance()->runDispatchLoopUntil(5);
+        if (g_pump && ((pos / block) % 8) == 0) juce::MessageManager::getInstance()->runDispatchLoopUntil(40);
         for (const auto m : midi) { (void)m; ++midiOut; }
         if (g_echo) g_echoBuf = midi;
         for (int ch = 0; ch < 2; ++ch) out.copyFrom(ch, pos, buf, ch, 0, n);
@@ -132,6 +132,20 @@ bool sameEdit(const juce::ValueTree& a, const juce::ValueTree& b)
     const auto* y = b.getProperty("editBuffer").getBinaryData();
     return x && y && *x == *y && int(a.getProperty("program", -1)) == int(b.getProperty("program", -1));
 }
+juce::String globalOf(const juce::ValueTree& t)
+{
+    const auto* mb = t.getProperty("globalData").getBinaryData();
+    if (!mb || mb->getSize() != 200) return "-";
+    const auto* p = static_cast<const uint8_t*>(mb->getData());
+    return juce::String(int(mb->getSize())) + " bytes, byte 4 " + juce::String(int(p[4]))
+         + ", fnv " + juce::String::toHexString((juce::int64)fnv(*mb));
+}
+bool sameGlobal(const juce::ValueTree& a, const juce::ValueTree& b)
+{
+    const auto* x = a.getProperty("globalData").getBinaryData();
+    const auto* y = b.getProperty("globalData").getBinaryData();
+    return x && y && x->getSize() == 200 && *x == *y;
+}
 juce::String lcdOf(const juce::ValueTree& t)
 {
     const auto* mb = t.getProperty("lcd").getBinaryData();
@@ -152,6 +166,15 @@ bool sameScreen(const juce::ValueTree& a, const juce::ValueTree& b)
     const auto* lx = a.getProperty("lcd").getBinaryData();
     const auto* ly = b.getProperty("lcd").getBinaryData();
     return x && y && *x == *y && lx && ly && *lx == *ly;
+}
+bool lcdContains(const juce::ValueTree& t, const juce::String& text)
+{
+    const auto* mb = t.getProperty("lcd").getBinaryData();
+    if (!mb || mb->getSize() != 34) return false;
+    const auto* p = static_cast<const uint8_t*>(mb->getData());
+    juce::String s;
+    for (int i = 0; i < 32; ++i) s << juce::juce_wchar(p[i]);
+    return s.contains(text);
 }
 } // namespace
 
@@ -175,22 +198,29 @@ int main(int argc, char** argv)
     int rc = 0;
     if (mode == "state") {
         inst->prepareToPlay(rate, block);
-        juce::AudioBuffer<float> tmp(2, int(15 * rate)); int mo = 0;
+        juce::AudioBuffer<float> tmp(2, int(32 * rate)); int mo = 0;
         tmp.clear();
         g_smf.emplace_back(int(3 * rate), juce::MidiMessage::programChange(1, 8));
         play(*inst, tmp, 0, int(4 * rate), block, -1, -1, mo);
         g_smf.clear();
         auto seed = stateOf(*inst);
-        const uint8_t editKeys[] = { 3, 7, 4, 2 };
-        seed.setProperty("screenKeys", juce::MemoryBlock(editKeys, sizeof editKeys), nullptr);
+        const auto* savedGlobal = seed.getProperty("globalData").getBinaryData();
+        if (!savedGlobal || savedGlobal->getSize() != 200) { std::cerr << "no live GLOBAL data\n"; return 9; }
+        juce::MemoryBlock global(*savedGlobal);
+        static_cast<uint8_t*>(global.getData())[4] = 4;
+        seed.setProperty("globalData", global, nullptr);
+        seed.setProperty("audioInThru", true, nullptr);
+        const uint8_t globalKeys[] = { 3, 6, 4, 6, 4, 6, 4, 6, 4, 6 };
+        seed.setProperty("screenKeys", juce::MemoryBlock(globalKeys, sizeof globalKeys), nullptr);
         setState(*inst, seed);
         g_pump = true;
-        play(*inst, tmp, int(4 * rate), int(8 * rate), block, -1, -1, mo);
+        play(*inst, tmp, int(4 * rate), int(26 * rate), block, -1, -1, mo);
         g_pump = false;
         auto a = stateOf(*inst);
         a.setProperty("knobs", "100,200,300,400,500,600,700,800,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,512,1000", nullptr);
         a.setProperty("mic2", true, nullptr); a.setProperty("editorW", 1234, nullptr);
-        std::cout << "A: " << flashOf(a) << ", edit " << editName(a) << ", lcd " << lcdOf(a) << "\n";
+        std::cout << "A: " << flashOf(a) << ", edit " << editName(a) << ", global " << globalOf(a)
+                  << ", AudioInThru " << (bool(a.getProperty("audioInThru", false)) ? "ON" : "OFF") << ", lcd " << lcdOf(a) << "\n";
         inst->releaseResources(); inst.reset();
         inst = load(fmt, *descs[0], rate, block);
         if (!inst) return 3;
@@ -198,18 +228,20 @@ int main(int argc, char** argv)
         inst->prepareToPlay(rate, block);
         tmp.clear();
         g_pump = true;
-        play(*inst, tmp, 0, int(7 * rate), block, -1, -1, mo);
+        play(*inst, tmp, 0, int(22 * rate), block, -1, -1, mo);
         g_pump = false;
         const auto b = stateOf(*inst);
-        std::cout << "B: " << flashOf(b) << ", edit " << editName(b) << ", lcd " << lcdOf(b) << "\n";
+        std::cout << "B: " << flashOf(b) << ", edit " << editName(b) << ", global " << globalOf(b)
+                  << ", AudioInThru " << (bool(b.getProperty("audioInThru", false)) ? "ON" : "OFF") << ", lcd " << lcdOf(b) << "\n";
         const bool same = flashOf(a) == flashOf(b) && a.getProperty("knobs") == b.getProperty("knobs")
                        && bool(b.getProperty("mic2")) && int(b.getProperty("editorW")) == 1234 && sameEdit(a, b)
-                       && sameScreen(a, b);
+                       && sameGlobal(a, b) && bool(a.getProperty("audioInThru", false))
+                       && bool(b.getProperty("audioInThru", false)) && sameScreen(a, b) && lcdContains(b, "AudioInThru:ON");
         std::cout << "state round trip: " << (same ? "SAME" : "DIFFERENT") << "\n";
         if (!same) rc = 5;
 
         const double beatsPerSecond = 132.0 / 60.0;
-        const int base = int(7 * rate);
+        const int base = int(22 * rate);
         const int firstOff = base + int((3.8316849816849818 / beatsPerSecond) * rate);
         const int second = base + int(((8.0 - 1.0479530885780886) / beatsPerSecond) * rate);
         const int secondOff = second + int((5.4169684482184479 / beatsPerSecond) * rate);
@@ -217,12 +249,12 @@ int main(int argc, char** argv)
         g_smf.emplace_back(firstOff, juce::MidiMessage::noteOff(1, 74));
         g_smf.emplace_back(second, juce::MidiMessage::noteOn(1, 57, (juce::uint8)50));
         g_smf.emplace_back(secondOff, juce::MidiMessage::noteOff(1, 57));
-        play(*inst, tmp, base, int(14 * rate), block, -1, -1, mo);
+        play(*inst, tmp, base, int(29 * rate), block, -1, -1, mo);
         g_smf.clear();
         float maxStep = 0.0f; int sharpSteps = 0, unexpectedSharpSteps = 0;
         for (int ch = 0; ch < 2; ++ch) {
             const auto* p = tmp.getReadPointer(ch);
-            for (int i = base + 1; i < int(14 * rate); ++i) {
+            for (int i = base + 1; i < int(29 * rate); ++i) {
                 const float d = std::abs(p[i] - p[i - 1]);
                 maxStep = juce::jmax(maxStep, d);
                 if (d > 0.25f) {

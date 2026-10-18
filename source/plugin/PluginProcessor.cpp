@@ -32,6 +32,9 @@ std::atomic<int> g_createdProcessors{ 0 };   // MAC-4: ever constructed here - t
 constexpr uint32_t kEditBufferAddr = 0x402E0Eu;
 constexpr uint32_t kProgramBankOffset = 0xA0400u;
 constexpr size_t kProgramBytes = 254;
+constexpr uint32_t kGlobalBufferAddr = 0x403206u;
+constexpr uint32_t kGlobalFlashOffset = 0xA0010u;
+constexpr size_t kGlobalBytes = 200;
 
 bool isSafeScreenKey(unsigned col, unsigned row)
 {
@@ -50,6 +53,11 @@ bool validEditBuffer(const std::vector<uint8_t>& p)
         hasName = hasName || p[i] != 0x20;
     }
     return hasName;
+}
+
+bool validGlobalData(const std::vector<uint8_t>& p)
+{
+    return p.size() == kGlobalBytes && std::any_of(p.begin(), p.end(), [](uint8_t b) { return b != 0; });
 }
 
 int findProgram(const std::vector<uint8_t>& p, const uint8_t* flash)
@@ -150,6 +158,7 @@ void Ms2kProcessor::timerCallback()
     m_syx.poll();
     powerSwitchPoll();
     restoreProjectEditBuffer();
+    restoreProjectAudioInThru();
     restoreProjectScreen();
     // HOSTDIAG-1 (R2, default off): MS2K_HOSTDIAG=1 -> once a second to the debugger output (DebugView): is the
     // host still calling processBlock, does the machine advance, and does render() hand out silence. For the
@@ -334,6 +343,13 @@ void Ms2kProcessor::userKnob(unsigned mux, unsigned x, uint16_t v)
 
 void Ms2kProcessor::userKey(unsigned col, unsigned row, bool down)
 {
+    if (down && m_runner && col == 4 && (row == 4 || row == 5)) {
+        const auto lcd = m_runner->getLcdGuiSnapshot();
+        if (juce::String(lcd.line1).startsWith("AudioInThru:")) {
+            std::lock_guard<std::mutex> l(m_globalDataMx);
+            m_projectAudioInThru = row == 4;
+        }
+    }
     if (down) rememberScreenKey(col, row);
     setSwitch(col, row, down);
     if (col < 8 && row < 8) userParam(m_keyParam[col][row], down ? 1.0f : 0.0f);
@@ -405,6 +421,13 @@ void Ms2kProcessor::powerSwitchPoll()
             std::lock_guard<std::mutex> e(m_editBufferMx);
             m_projectProgram = findProgram(edit, f.data());
             m_projectEditBuffer = std::move(edit);
+        }
+        std::vector<uint8_t> global(kGlobalBytes);
+        for (size_t i = 0; i < global.size(); ++i)
+            global[i] = m_runner->getEmulator().peekExternal(kGlobalBufferAddr + uint32_t(i));
+        {
+            std::lock_guard<std::mutex> g(m_globalDataMx);
+            m_projectGlobalData = std::move(global);
         }
         stopMachine();
         clearStreams();
@@ -481,7 +504,20 @@ bool Ms2kProcessor::startMachine()
     MS2000::Ms2kGuiHooks hooks;
     hooks.logFn = [](const char*) {};
     m_runner = std::make_unique<MS2000::Ms2kRunner>(cfg, hooks);
-    if (!m_runner->init() || !m_runner->startManual()) {
+    if (!m_runner->init()) {
+        setStatus("The machine did not start (ROM load / init failed).");
+        m_runner.reset();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> l(m_globalDataMx);
+        if (m_projectGlobalData.size() == kGlobalBytes) {
+            auto& flash = m_runner->getEmulator().getFlashROM();
+            if (flash.size() >= kGlobalFlashOffset + kGlobalBytes)
+                std::copy(m_projectGlobalData.begin(), m_projectGlobalData.end(), flash.data() + kGlobalFlashOffset);
+        }
+    }
+    if (!m_runner->startManual()) {
         setStatus("The machine did not start (ROM load / init failed).");
         m_runner.reset();
         return false;
@@ -495,6 +531,13 @@ bool Ms2kProcessor::startMachine()
     {
         std::lock_guard<std::mutex> l(m_editBufferMx);
         if (validEditBuffer(m_projectEditBuffer)) m_restoreEditPending = true;
+    }
+    {
+        std::lock_guard<std::mutex> l(m_globalDataMx);
+        m_restoreAudioInThruIndex = 0;
+        m_restoreAudioInThruDown = false;
+        m_restoreAudioInThruDelay = 2;
+        m_restoreAudioInThruPending = m_projectAudioInThru;
     }
     {
         std::lock_guard<std::mutex> l(m_screenMx);
@@ -542,10 +585,47 @@ void Ms2kProcessor::restoreProjectEditBuffer()
     }
 }
 
+void Ms2kProcessor::restoreProjectAudioInThru()
+{
+    static constexpr unsigned keys[][2] = {
+        { 3, 6 }, { 4, 6 }, { 4, 6 }, { 4, 6 }, { 4, 6 }, { 4, 4 }, { 4, 0 }
+    };
+    std::lock_guard<std::mutex> l(m_globalDataMx);
+    if (!m_restoreAudioInThruPending || !m_runner) return;
+    {
+        std::lock_guard<std::mutex> e(m_editBufferMx);
+        if (m_restoreEditPending || m_restoreEditActive) return;
+    }
+    if (m_syx.busy()) return;
+    if (m_restoreAudioInThruDelay > 0) {
+        --m_restoreAudioInThruDelay;
+        return;
+    }
+    if (m_restoreAudioInThruIndex >= std::size(keys)) {
+        m_restoreAudioInThruPending = false;
+        m_restoreAudioInThruDown = false;
+        return;
+    }
+
+    const auto& key = keys[m_restoreAudioInThruIndex];
+    m_runner->getEmulator().setPanelSwitch(key[0], key[1], !m_restoreAudioInThruDown);
+    if (m_restoreAudioInThruDown) {
+        m_restoreAudioInThruDown = false;
+        ++m_restoreAudioInThruIndex;
+    } else {
+        m_restoreAudioInThruDown = true;
+    }
+    m_restoreAudioInThruDelay = 1;
+}
+
 void Ms2kProcessor::restoreProjectScreen()
 {
     std::lock_guard<std::mutex> l(m_screenMx);
     if (!m_restoreScreenPending || !m_runner) return;
+    {
+        std::lock_guard<std::mutex> g(m_globalDataMx);
+        if (m_restoreAudioInThruPending) return;
+    }
     {
         std::lock_guard<std::mutex> e(m_editBufferMx);
         if (m_restoreEditPending || m_restoreEditActive) return;
@@ -976,14 +1056,16 @@ void Ms2kProcessor::saveGlobalSettings() const
 }
 
 // ---- plugin state (VST3-2) ----
-// A ValueTree "MS2000R": v=3, knobs = 32 positions "a,b,..", in1/in2/volume, mic2/dac20, editorW/editorTab,
+// A ValueTree "MS2000R": v=4, knobs = 32 positions "a,b,..", in1/in2/volume, mic2/dac20, editorW/editorTab,
 // flashMask (sectors SA0..SA18 not factory any more) and flash = those sectors' bytes in SA order, gzipped.
 // The complete live edit buffer and its program slot are saved too, so the project recalls the audible program.
+// globalData holds the live GLOBAL working buffer, including changes that have not been written to flash.
+// audioInThru preserves the one GLOBAL option that the hardware deliberately resets at every power-on.
 // screenKeys holds safe front-panel navigation presses, replayed after the program so the firmware restores its LCD page.
 void Ms2kProcessor::getStateInformation(juce::MemoryBlock& dest)
 {
     juce::ValueTree t("MS2000R");
-    t.setProperty("v", 3, nullptr);
+    t.setProperty("v", 4, nullptr);
     juce::String k;
     for (int i = 0; i < 32; ++i) k << (i ? "," : "") << int(knobs[i / 8][i % 8]);
     t.setProperty("knobs", k, nullptr);
@@ -1022,6 +1104,28 @@ void Ms2kProcessor::getStateInformation(juce::MemoryBlock& dest)
         m_projectEditBuffer = edit;
         m_projectProgram = program;
     }
+    std::vector<uint8_t> global;
+    if (m_runner) {
+        global.resize(kGlobalBytes);
+        for (size_t i = 0; i < global.size(); ++i)
+            global[i] = m_runner->getEmulator().peekExternal(kGlobalBufferAddr + uint32_t(i));
+        if (!validGlobalData(global)) global.clear();
+    }
+    if (global.empty()) {
+        std::lock_guard<std::mutex> l(m_globalDataMx);
+        global = m_projectGlobalData;
+    }
+    if (validGlobalData(global)) {
+        t.setProperty("globalData", juce::MemoryBlock(global.data(), global.size()), nullptr);
+        std::lock_guard<std::mutex> l(m_globalDataMx);
+        m_projectGlobalData = global;
+    }
+    bool audioInThru = false;
+    {
+        std::lock_guard<std::mutex> l(m_globalDataMx);
+        audioInThru = m_projectAudioInThru;
+    }
+    t.setProperty("audioInThru", audioInThru, nullptr);
     {
         std::lock_guard<std::mutex> l(m_screenMx);
         if (!m_screenKeys.empty()) {
@@ -1085,6 +1189,27 @@ void Ms2kProcessor::setStateInformation(const void* data, int size)
         m_restoreEditPending = !m_projectEditBuffer.empty();
         m_restoreEditActive = false;
     }
+    std::vector<uint8_t> global;
+    if (const auto* mb = t.getProperty("globalData").getBinaryData(); mb && mb->getSize() == kGlobalBytes)
+        global.assign(static_cast<const uint8_t*>(mb->getData()), static_cast<const uint8_t*>(mb->getData()) + mb->getSize());
+    if (!validGlobalData(global)) global.clear();
+    bool sameGlobal = true;
+    if (m_runner && !global.empty()) {
+        for (size_t i = 0; i < global.size() && sameGlobal; ++i)
+            sameGlobal = global[i] == m_runner->getEmulator().peekExternal(kGlobalBufferAddr + uint32_t(i));
+    }
+    const bool audioInThru = bool(t.getProperty("audioInThru", false));
+    bool sameAudioInThru = true;
+    {
+        std::lock_guard<std::mutex> l(m_globalDataMx);
+        sameAudioInThru = audioInThru == m_projectAudioInThru;
+        m_projectGlobalData = std::move(global);
+        m_projectAudioInThru = audioInThru;
+        m_restoreAudioInThruIndex = 0;
+        m_restoreAudioInThruPending = false;
+        m_restoreAudioInThruDown = false;
+        m_restoreAudioInThruDelay = 0;
+    }
     {
         std::lock_guard<std::mutex> l(m_screenMx);
         if (m_restoreScreenDown && m_runner && m_restoreScreenIndex + 1 < m_screenKeys.size())
@@ -1132,7 +1257,7 @@ void Ms2kProcessor::setStateInformation(const void* data, int size)
         }
     }
     m_haveProjectFlash = true; m_projectMask = mask; m_projectImage = std::move(img);
-    if (m_runner && !same) {                 // a different machine: power cycle it with this flash
+    if (m_runner && (!same || !sameGlobal || !sameAudioInThru)) {                 // a different machine: power cycle it with this flash
         std::lock_guard<std::mutex> l(m_machineMx);
         stopMachine();
         clearStreams();
