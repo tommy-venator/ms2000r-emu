@@ -39,11 +39,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force out | Out-Null
-          Get-ChildItem build_vst -Recurse -Directory -Filter "*.vst3" |
+          $bundle = Get-ChildItem build_vst -Recurse -Directory -Filter "*.vst3" |
             Where-Object { $_.FullName -notmatch '\\Contents\\' } |
-            ForEach-Object { Copy-Item $_.FullName out -Recurse -Force }
-          Get-ChildItem build_vst -Recurse -File -Filter "*.vst3" |
-            ForEach-Object { Copy-Item $_.FullName out -Force }
+            Select-Object -First 1
+          if (-not $bundle) { Write-Error "No .vst3 bundle found"; exit 1 }
+          Copy-Item $bundle.FullName out -Recurse -Force
           Get-ChildItem out -Recurse | Select-Object FullName
 
       - uses: actions/upload-artifact@v4
