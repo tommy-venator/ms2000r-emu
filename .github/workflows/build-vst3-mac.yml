@@ -35,6 +35,7 @@ jobs:
       - name: Configure
         run: |
           cmake -S . -B build_vst -DCMAKE_BUILD_TYPE=Release -DMS2K_BUILD_VST3=ON \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/shim" \
             -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/shim"
 
@@ -58,11 +59,11 @@ jobs:
           bundle=$(find build_vst -type d -name "*.vst3" | head -1)
           [ -n "$bundle" ] || { echo "No .vst3 bundle found"; exit 1; }
           mkdir -p out
-          ditto -c -k --keepParent "$bundle" "out/MS2000R-vst3-macos-arm64.zip"
+          ditto -c -k --keepParent "$bundle" "out/MS2000R-vst3-macos-x86_64.zip"
           ls -l out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MS2000R-VST3-macOS-arm64
+          name: MS2000R-vst3-macos-x86_64.zip
           path: out
           if-no-files-found: error
