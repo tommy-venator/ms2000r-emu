@@ -7,18 +7,18 @@ on:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-14      # Apple Silicon (M1/M2/M3/M4)
-            label: arm64
-          - runner: macos-13      # Intel
-            label: x86_64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14   # Apple Silicon
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Patch intrin.h include (not available on macOS)
+        run: |
+          grep -rlE --include='*.h' --include='*.cpp' --include='*.inl' '#include <intrin.h>' external/dsp56300 | while read -r f; do
+            perl -0pi -e 's|#include <intrin.h>|#if defined(_MSC_VER)\n#include <intrin.h>\n#elif defined(__x86_64__)\n#include <x86intrin.h>\n#endif|g' "$f"
+            echo "patched $f"
+          done || true
 
       - name: Configure
         run: cmake -S . -B build_vst -DCMAKE_BUILD_TYPE=Release -DMS2K_BUILD_VST3=ON
@@ -39,11 +39,11 @@ jobs:
           bundle=$(find build_vst -type d -name "*.vst3" | head -1)
           [ -n "$bundle" ] || { echo "No .vst3 bundle found"; exit 1; }
           mkdir -p out
-          ditto -c -k --keepParent "$bundle" "out/MS2000R-vst3-macos-${{ matrix.label }}.zip"
+          ditto -c -k --keepParent "$bundle" "out/MS2000R-vst3-macos-arm64.zip"
           ls -l out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MS2000R-VST3-macOS-${{ matrix.label }}
+          name: MS2000R-VST3-macOS-arm64
           path: out
           if-no-files-found: error
