@@ -1,0 +1,49 @@
+name: Build macOS VST3
+
+on:
+  push:
+    branches: [ fix/plugin-program-recall ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14      # Apple Silicon (M1/M2/M3/M4)
+            label: arm64
+          - runner: macos-13      # Intel
+            label: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure
+        run: cmake -S . -B build_vst -DCMAKE_BUILD_TYPE=Release -DMS2K_BUILD_VST3=ON
+
+      - name: Find plugin target
+        id: tgt
+        run: |
+          name=$(cmake --build build_vst --target help | grep -o '[A-Za-z0-9_]*_VST3' | head -1)
+          echo "Target: $name"
+          [ -n "$name" ] || { echo "No *_VST3 target found"; exit 1; }
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cmake --build build_vst --config Release --target ${{ steps.tgt.outputs.name }} --parallel
+
+      - name: Package .vst3
+        run: |
+          bundle=$(find build_vst -type d -name "*.vst3" | head -1)
+          [ -n "$bundle" ] || { echo "No .vst3 bundle found"; exit 1; }
+          mkdir -p out
+          ditto -c -k --keepParent "$bundle" "out/MS2000R-vst3-macos-${{ matrix.label }}.zip"
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MS2000R-VST3-macOS-${{ matrix.label }}
+          path: out
+          if-no-files-found: error
