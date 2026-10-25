@@ -26,6 +26,9 @@ jobs:
           #if defined(__x86_64__) || defined(__i386__)
           #include <x86intrin.h>
           #endif
+          #ifndef _ReturnAddress
+          #define _ReturnAddress() __builtin_return_address(0)
+          #endif
           EOF
           cat "$GITHUB_WORKSPACE/shim/intrin.h"
 
