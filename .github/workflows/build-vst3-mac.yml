@@ -13,15 +13,27 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Patch intrin.h include (not available on macOS)
+      - name: Diagnose intrin.h usage
         run: |
-          grep -rlE --include='*.h' --include='*.cpp' --include='*.inl' '#include <intrin.h>' external/dsp56300 | while read -r f; do
-            perl -0pi -e 's|#include <intrin.h>|#if defined(_MSC_VER)\n#include <intrin.h>\n#elif defined(__x86_64__)\n#include <x86intrin.h>\n#endif|g' "$f"
-            echo "patched $f"
-          done || true
+          grep -rn "intrin.h" external/dsp56300/source/dsp56kEmu | head -20 || true
+          sed -n 1,15p external/dsp56300/source/dsp56kEmu/utils.h || true
+
+      - name: Create intrin.h stand-in for macOS
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/shim"
+          cat > "$GITHUB_WORKSPACE/shim/intrin.h" <<'EOF'
+          #pragma once
+          #if defined(__x86_64__) || defined(__i386__)
+          #include <x86intrin.h>
+          #endif
+          EOF
+          cat "$GITHUB_WORKSPACE/shim/intrin.h"
 
       - name: Configure
-        run: cmake -S . -B build_vst -DCMAKE_BUILD_TYPE=Release -DMS2K_BUILD_VST3=ON
+        run: |
+          cmake -S . -B build_vst -DCMAKE_BUILD_TYPE=Release -DMS2K_BUILD_VST3=ON \
+            -DCMAKE_CXX_FLAGS="-I$GITHUB_WORKSPACE/shim" \
+            -DCMAKE_C_FLAGS="-I$GITHUB_WORKSPACE/shim"
 
       - name: Find plugin target
         id: tgt
@@ -32,7 +44,11 @@ jobs:
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - name: Build
-        run: cmake --build build_vst --config Release --target ${{ steps.tgt.outputs.name }} --parallel
+        run: cmake --build build_vst --config Release --target ${{ steps.tgt.outputs.name }} --parallel -- -k 2>&1 | tee build.log; test ${PIPESTATUS[0]} -eq 0
+
+      - name: Show first errors
+        if: failure()
+        run: grep -n "error:" build.log | head -30 || true
 
       - name: Package .vst3
         run: |
